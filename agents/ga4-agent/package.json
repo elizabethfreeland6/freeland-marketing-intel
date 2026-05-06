@@ -1,0 +1,9 @@
+{
+  "name": "ga4-agent",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "@google-analytics/data": "^4.8.0",
+    "@supabase/supabase-js": "^2.45.0"
+  }
+}
