@@ -1,3 +1,8 @@
+import { config } from 'dotenv'
+import { fileURLToPath } from 'url'
+import { dirname, resolve } from 'path'
+config({ path: resolve(dirname(fileURLToPath(import.meta.url)), '../../.env') })
+
 import { BetaAnalyticsDataClient } from '@google-analytics/data'
 import { OAuth2Client } from 'google-auth-library'
 import { createClient } from '@supabase/supabase-js'
