@@ -85,6 +85,7 @@ async function runGA4Pull() {
   const supabase = makeSupabase()
 
   for (const dealership of DEALERSHIPS) {
+    if (!dealership.ga4PropertyId) continue
     await pullDealership(analyticsClient, supabase, dealership)
   }
 }
