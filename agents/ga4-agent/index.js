@@ -1,16 +1,25 @@
 import { BetaAnalyticsDataClient } from '@google-analytics/data'
+import { OAuth2Client } from 'google-auth-library'
 import { createClient } from '@supabase/supabase-js'
 import { DEALERSHIPS } from '../../lib/config.js'
-
-const PROPERTY_IDS = {
-  chevrolet: process.env.GA4_PROPERTY_CHEVROLET,
-  cdjr: process.env.GA4_PROPERTY_CDJR,
-}
 
 function yesterday() {
   const d = new Date()
   d.setDate(d.getDate() - 1)
   return d.toISOString().slice(0, 10)
+}
+
+function makeOAuthClient() {
+  const client = new OAuth2Client(
+    process.env.GA4_OAUTH_CLIENT_ID,
+    process.env.GA4_OAUTH_CLIENT_SECRET
+  )
+  client.setCredentials({ refresh_token: process.env.GA4_OAUTH_REFRESH_TOKEN })
+  return client
+}
+
+function makeAnalyticsClient(authClient) {
+  return new BetaAnalyticsDataClient({ authClient })
 }
 
 function makeSupabase() {
@@ -20,19 +29,11 @@ function makeSupabase() {
   )
 }
 
-function makeAnalyticsClient() {
-  const credentials = JSON.parse(process.env.MARKETING_GA4_CREDENTIALS)
-  return new BetaAnalyticsDataClient({ credentials })
-}
-
 async function pullDealership(analyticsClient, supabase, dealership) {
-  const propertyId = PROPERTY_IDS[dealership.id]
-  if (!propertyId) throw new Error(`No GA4 property ID for ${dealership.id}`)
-
   const date = yesterday()
 
   const [response] = await analyticsClient.runReport({
-    property: `properties/${propertyId}`,
+    property: `properties/${dealership.ga4PropertyId}`,
     dateRanges: [{ startDate: date, endDate: date }],
     dimensions: [
       { name: 'sessionSourceMedium' },
@@ -74,7 +75,8 @@ async function pullDealership(analyticsClient, supabase, dealership) {
 }
 
 async function runGA4Pull() {
-  const analyticsClient = makeAnalyticsClient()
+  const authClient = makeOAuthClient()
+  const analyticsClient = makeAnalyticsClient(authClient)
   const supabase = makeSupabase()
 
   for (const dealership of DEALERSHIPS) {
