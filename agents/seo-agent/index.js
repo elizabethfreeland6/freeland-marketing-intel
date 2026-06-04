@@ -1,12 +1,15 @@
+import { config } from 'dotenv'
+import { fileURLToPath } from 'url'
+import { dirname, resolve } from 'path'
+config({ path: resolve(dirname(fileURLToPath(import.meta.url)), '../../.env') })
+
 import { ApifyClient } from 'apify-client'
 import { google } from 'googleapis'
+import { OAuth2Client } from 'google-auth-library'
 import { createClient } from '@supabase/supabase-js'
+import Anthropic from '@anthropic-ai/sdk'
 import { DEALERSHIPS } from '../../lib/config.js'
 
-const GSC_SITES = {
-  chevrolet: process.env.GSC_SITE_URL_CHEVROLET,
-  cdjr: process.env.GSC_SITE_URL_CDJR,
-}
 
 function daysAgo(n) {
   const d = new Date()
@@ -22,11 +25,12 @@ function makeSupabase() {
 }
 
 function makeGSCAuth() {
-  return new google.auth.JWT({
-    email: process.env.GSC_CLIENT_EMAIL,
-    key: process.env.GSC_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-    scopes: ['https://www.googleapis.com/auth/webmasters.readonly'],
-  })
+  const client = new OAuth2Client(
+    process.env.GA4_OAUTH_CLIENT_ID,
+    process.env.GA4_OAUTH_CLIENT_SECRET
+  )
+  client.setCredentials({ refresh_token: process.env.GSC_OAUTH_REFRESH_TOKEN })
+  return client
 }
 
 async function runKeywordRankings(supabase) {
@@ -100,7 +104,7 @@ async function runGSCPull(supabase) {
   const startDate = daysAgo(7)
 
   for (const dealership of DEALERSHIPS) {
-    const siteUrl = GSC_SITES[dealership.id]
+    const siteUrl = dealership.gscProperty
     if (!siteUrl) continue
 
     const res = await sc.searchanalytics.query({
@@ -138,9 +142,8 @@ async function runLighthouse(supabase) {
   const apify = new ApifyClient({ token: process.env.APIFY_TOKEN })
 
   for (const dealership of DEALERSHIPS) {
-    const run = await apify.actor('apify/lighthouse-scraper').call({
-      startUrls: [{ url: dealership.url }],
-      onlyFirstPage: true,
+    const run = await apify.actor('constant_quadruped/lighthouse-auditor').call({
+      url: dealership.url,
     })
 
     const { items } = await apify.dataset(run.defaultDatasetId).listItems()
@@ -150,20 +153,19 @@ async function runLighthouse(supabase) {
       continue
     }
 
-    const cats = item.lighthouseResult?.categories ?? {}
-    const audits = item.lighthouseResult?.audits ?? {}
+    const cwv = item.coreWebVitals ?? {}
 
     const record = {
       dealership_id: dealership.id,
       url: dealership.url,
-      performance_score: cats.performance?.score != null ? cats.performance.score * 100 : null,
-      accessibility_score: cats.accessibility?.score != null ? cats.accessibility.score * 100 : null,
-      best_practices_score: cats['best-practices']?.score != null ? cats['best-practices'].score * 100 : null,
-      seo_score: cats.seo?.score != null ? cats.seo.score * 100 : null,
-      lcp: audits['largest-contentful-paint']?.numericValue ?? null,
-      fid: audits['max-potential-fid']?.numericValue ?? null,
-      cls: audits['cumulative-layout-shift']?.numericValue ?? null,
-      raw_json: item.lighthouseResult ?? null,
+      performance_score: item.performance ?? null,
+      accessibility_score: item.accessibility ?? null,
+      best_practices_score: item.bestPractices ?? null,
+      seo_score: item.seo ?? null,
+      lcp: cwv.LCP ?? null,
+      fid: null,
+      cls: cwv.CLS ?? null,
+      raw_json: item,
       captured_at: new Date().toISOString(),
       source: 'lighthouse',
     }
@@ -174,12 +176,111 @@ async function runLighthouse(supabase) {
   }
 }
 
+async function runCTRAnalysis(supabase) {
+  const since = daysAgo(30)
+
+  // Aggregate GSC data by page over last 30 days
+  const { data: rows, error } = await supabase
+    .from('rankings_organic')
+    .select('dealership_id, url, keyword, clicks, impressions, ctr')
+    .eq('source', 'gsc')
+    .gte('captured_at', since)
+
+  if (error) {
+    console.error('[ctr] query error:', error.message)
+    return
+  }
+
+  // Aggregate by page
+  const pages = {}
+  for (const row of rows ?? []) {
+    const key = `${row.dealership_id}|${row.url}`
+    if (!pages[key]) pages[key] = { dealership_id: row.dealership_id, url: row.url, clicks: 0, impressions: 0, queries: {} }
+    pages[key].clicks += row.clicks ?? 0
+    pages[key].impressions += row.impressions ?? 0
+    if (row.keyword) {
+      pages[key].queries[row.keyword] = (pages[key].queries[row.keyword] ?? 0) + (row.clicks ?? 0)
+    }
+  }
+
+  // Filter: >50 impressions, CTR < 2%
+  const flagged = Object.values(pages).filter(
+    (p) => p.impressions > 50 && (p.clicks / p.impressions) < 0.02,
+  )
+
+  if (!flagged.length) {
+    console.log('[ctr] No underperforming pages found')
+    return
+  }
+
+  const anthropic = new Anthropic()
+  const suggestions = []
+
+  for (const page of flagged) {
+    const topQueries = Object.entries(page.queries)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([q]) => q)
+
+    const ctr = (page.clicks / page.impressions * 100).toFixed(1)
+    console.log(`[ctr] Flagged: ${page.url} (${ctr}% CTR, ${page.impressions} impressions)`)
+
+    if (!topQueries.length) continue
+
+    let titleSuggestion = null
+    let metaSuggestion = null
+
+    try {
+      const msg = await anthropic.messages.create({
+        model: 'claude-opus-4-7',
+        max_tokens: 300,
+        messages: [{
+          role: 'user',
+          content: `Write an improved HTML page title and meta description for a car-buying landing page at ${page.url}. The page gets impressions for these search queries: ${topQueries.join(', ')}. Current CTR is only ${ctr}% — the goal is higher click-through from search results. Nashville, TN local business. No em dashes. Title under 60 chars, description under 160 chars. Reply with exactly two lines:\nTITLE: <title here>\nDESCRIPTION: <description here>`,
+        }],
+      })
+      const text = msg.content[0]?.text ?? ''
+      titleSuggestion = text.match(/^TITLE:\s*(.+)/m)?.[1]?.trim() ?? null
+      metaSuggestion = text.match(/^DESCRIPTION:\s*(.+)/m)?.[1]?.trim() ?? null
+    } catch (err) {
+      console.error('[ctr] Claude error:', err.message)
+    }
+
+    suggestions.push({
+      dealership_id: page.dealership_id,
+      url: page.url,
+      impressions: page.impressions,
+      clicks: page.clicks,
+      ctr_pct: parseFloat(ctr),
+      top_queries: topQueries,
+      suggested_title: titleSuggestion,
+      suggested_description: metaSuggestion,
+      flagged_at: new Date().toISOString(),
+    })
+  }
+
+  if (suggestions.length) {
+    const report = {
+      type: 'ctr_analysis',
+      week_of: new Date().toISOString().slice(0, 10),
+      flagged_pages: suggestions,
+    }
+    const { error: insertErr } = await supabase.from('seo_ctr_flags').upsert(
+      suggestions.map((s) => ({ ...s, week_of: report.week_of })),
+      { onConflict: 'dealership_id,url,week_of', ignoreDuplicates: false },
+    )
+    if (insertErr) console.error('[ctr] insert error:', insertErr.message)
+    console.log(`[ctr] ${suggestions.length} underperforming pages flagged and stored`)
+  }
+}
+
 async function main() {
   console.log('SEO agent starting…')
   const supabase = makeSupabase()
   await runKeywordRankings(supabase)
   await runGSCPull(supabase)
   await runLighthouse(supabase)
+  await runCTRAnalysis(supabase)
   console.log('SEO agent done.')
 }
 
